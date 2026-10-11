@@ -10,7 +10,9 @@ package org.dspace.app.ldn;
 import static org.dspace.app.ldn.LDNMessageEntity.QUEUE_STATUS_FAILED;
 import static org.dspace.app.ldn.LDNMessageEntity.QUEUE_STATUS_PROCESSED;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.startsWith;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -25,6 +27,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +36,8 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import org.dspace.AbstractIntegrationTestWithDatabase;
 import org.dspace.app.ldn.factory.NotifyServiceFactory;
@@ -67,7 +72,6 @@ import org.junit.Test;
 public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatabase {
 
     private static final String ORIGIN_ID = "https://teslaris.example.org";
-    private static final String ORIGIN_INBOX = "https://teslaris.example.org/api/coar-notify/inbox";
     private static final String SOURCE_IP = "127.0.0.1";
     private static final byte[] PDF = "%PDF-1.4\nthesis test file\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
 
@@ -81,8 +85,11 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
 
     private final Map<String, AtomicInteger> hits = new ConcurrentHashMap<>();
     private final List<String> notificationIds = new ArrayList<>();
+    private final List<JsonNode> acks = Collections.synchronizedList(new ArrayList<>());
+    private volatile int inboxStatus = 201;
     private HttpServer server;
     private String baseUrl;
+    private String originInbox;
     private Collection collection;
 
     @Before
@@ -97,7 +104,7 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
                                       .withName("Incoming from TeslaRIS").build();
         NotifyServiceBuilder.createNotifyServiceBuilder(context, "TeslaRIS")
                             .withUrl(ORIGIN_ID)
-                            .withLdnUrl(ORIGIN_INBOX)
+                            .withLdnUrl(originInbox)
                             .withLowerIp(SOURCE_IP)
                             .withUpperIp(SOURCE_IP)
                             .withStatus(true)
@@ -120,13 +127,21 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
             server.stop(0);
         }
         context.turnOffAuthorisationSystem();
-        for (String id : notificationIds) {
-            for (Item item : itemsFor(id)) {
-                itemService.delete(context, item);
-            }
+        // acknowledgements first, they point at the offers
+        List<String> messageIds = new ArrayList<>();
+        synchronized (acks) {
+            acks.forEach(ack -> messageIds.add(ack.path("id").asText()));
+        }
+        messageIds.addAll(notificationIds);
+        for (String id : messageIds) {
             LDNMessageEntity msg = ldnMessageService.find(context, id);
             if (msg != null) {
                 ldnMessageService.delete(context, msg);
+            }
+        }
+        for (String id : notificationIds) {
+            for (Item item : itemsFor(id)) {
+                itemService.delete(context, item);
             }
         }
         context.restoreAuthSystemState();
@@ -164,6 +179,31 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
             assertArrayEquals(PDF, in.readAllBytes());
         }
         assertEquals(1, hits("/files/ok"));
+
+        JsonNode accept = ackFor(id);
+        assertEquals("Accept", accept.path("type").asText());
+        assertEquals(id, accept.path("inReplyTo").asText());
+        assertEquals(id, accept.path("object").path("id").asText());
+        assertTrue(accept.path("object").path("@context").isMissingNode());
+        assertEquals(baseUrl + "/files/ok?transferToken=abc&expires=9999999999",
+            accept.path("object").path("object").path("ietf:item").path("id").asText());
+        assertEquals("https://www.w3.org/ns/activitystreams", accept.path("@context").path(0).asText());
+        assertEquals("https://coar-notify.net", accept.path("@context").path(1).asText());
+        assertEquals(configurationService.getProperty("ldn.notify.inbox"),
+            accept.path("origin").path("inbox").asText());
+        assertEquals(originInbox, accept.path("target").path("inbox").asText());
+        String uiUrl = configurationService.getProperty("dspace.ui.url");
+        assertEquals(uiUrl + "/items/" + item.getID(), accept.path("context").path("id").asText());
+        assertThat(accept.path("context").path("ietf:cite-as").asText(), containsString(item.getHandle()));
+        assertEquals(uiUrl + "/bitstreams/" + bitstream.getID() + "/download",
+            accept.path("context").path("ietf:item").path("id").asText());
+        assertTrue(accept.path("summary").isMissingNode());
+
+        LDNMessageEntity sent = ldnMessageService.find(context, accept.path("id").asText());
+        assertNotNull(sent);
+        assertEquals(QUEUE_STATUS_PROCESSED, sent.getQueueStatus());
+        assertEquals(id, sent.getInReplyTo().getID());
+        assertEquals(item.getID(), sent.getObject().getID());
     }
 
     @Test
@@ -172,25 +212,26 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         ldnMessageService.extractAndProcessMessageFromQueue(context);
         assertEquals(QUEUE_STATUS_PROCESSED, ldnMessageService.find(context, accepted).getQueueStatus());
         assertEquals(1, itemsFor(accepted).size());
+        assertEquals("Accept", ackFor(accepted).path("type").asText());
 
         configurationService.setProperty("ldn.filetransfer.require-digest", true);
         String rejected = queueOffer(baseUrl + "/files/no-digest", "application/pdf");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
-        assertFailedWithoutItem(rejected);
+        assertRejected(rejected, "digest-missing");
     }
 
     @Test
     public void digestMismatchFailsAndLeavesNothingBehind() throws Exception {
         String id = queueOffer(baseUrl + "/files/bad-digest", "application/pdf");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
-        assertFailedWithoutItem(id);
+        assertRejected(id, "digest-mismatch");
     }
 
     @Test
     public void expiredTokenFails() throws Exception {
         String id = queueOffer(baseUrl + "/files/expired", "application/pdf");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
-        assertFailedWithoutItem(id);
+        assertRejected(id, "expired");
     }
 
     @Test
@@ -198,31 +239,36 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         configurationService.setProperty("ldn.filetransfer.max-size-bytes", 10L);
         String id = queueOffer(baseUrl + "/files/ok", "application/pdf");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
-        assertFailedWithoutItem(id);
+        assertRejected(id, "too-large");
     }
 
     @Test
     public void forbiddenHostsAndSchemesAreNeverFetched() throws Exception {
         String metadata = queueOffer("http://169.254.169.254/latest/meta-data/", "text/plain");
         String file = queueOffer("file:///etc/passwd", "text/plain");
-        configurationService.setProperty("ldn.filetransfer.forbiddenHostUrls", "127.0.0.1");
+        // a configured list replaces the defaults
+        configurationService.setProperty("ldn.filetransfer.forbiddenHostUrls",
+            new String[] {"169.254.169.254", "127.0.0.1"});
         String loopback = queueOffer(baseUrl + "/files/ok", "application/pdf");
 
         ldnMessageService.extractAndProcessMessageFromQueue(context);
 
-        assertFailedWithoutItem(metadata);
-        assertFailedWithoutItem(file);
-        assertFailedWithoutItem(loopback);
+        assertRejected(metadata, "url-rejected");
+        assertRejected(file, "url-rejected");
+        assertRejected(loopback, "url-rejected");
         assertEquals("the forbidden local URL must not be requested", 0, hits("/files/ok"));
     }
 
     @Test
     public void localAddressesAreBlockedByResolution() throws Exception {
-        // "localhost" is not on the forbidden list here, but resolves to a loopback address
+        // not on the forbidden list, but localhost is loopback and 169.254.169.254 is link-local
+        configurationService.setProperty("ldn.filetransfer.forbiddenHostUrls", "blocked.example.invalid");
         configurationService.setProperty("ldn.filetransfer.block-local-addresses", true);
         String id = queueOffer(baseUrl.replace("127.0.0.1", "localhost") + "/files/ok", "application/pdf");
+        String metadata = queueOffer("http://169.254.169.254/latest/meta-data/", "text/plain");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
-        assertFailedWithoutItem(id);
+        assertRejected(id, "url-rejected");
+        assertRejected(metadata, "url-rejected");
         assertEquals(0, hits("/files/ok"));
     }
 
@@ -238,6 +284,11 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
 
         assertEquals(1, itemsFor(offer.getId()).size());
         assertEquals("the file is fetched only once", 1, hits("/files/ok"));
+        assertEquals(2, acks.size());
+        assertEquals("Accept", acks.get(0).path("type").asText());
+        assertEquals("Accept", acks.get(1).path("type").asText());
+        assertEquals(acks.get(0).path("context").path("id").asText(),
+            acks.get(1).path("context").path("id").asText());
     }
 
     @Test
@@ -248,6 +299,7 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         // the original processor only handles offers about existing local items
         assertFailedWithoutItem(id);
         assertEquals(0, hits("/files/ok"));
+        assertTrue(acks.isEmpty());
     }
 
     @Test
@@ -259,6 +311,40 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         assertEquals(null, ReprDigest.parseSha256("sha-256=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="));
         assertEquals(null, ReprDigest.parseSha256("sha-256=:AAAA:"));
         assertEquals(null, ReprDigest.parseSha256(null));
+    }
+
+    @Test
+    public void undeliverableAcceptKeepsItemAndIsRecordedAsFailed() throws Exception {
+        inboxStatus = 503;
+        String id = queueOffer(baseUrl + "/files/ok", "application/pdf");
+        ldnMessageService.extractAndProcessMessageFromQueue(context);
+
+        assertEquals(QUEUE_STATUS_PROCESSED, ldnMessageService.find(context, id).getQueueStatus());
+        assertEquals(1, itemsFor(id).size());
+        LDNMessageEntity sent = ldnMessageService.find(context, ackFor(id).path("id").asText());
+        assertEquals(QUEUE_STATUS_FAILED, sent.getQueueStatus());
+    }
+
+    private JsonNode ackFor(String offerId) {
+        List<JsonNode> matching = new ArrayList<>();
+        synchronized (acks) {
+            for (JsonNode ack : acks) {
+                if (offerId.equals(ack.path("inReplyTo").asText())) {
+                    matching.add(ack);
+                }
+            }
+        }
+        assertEquals("acknowledgements for " + offerId, 1, matching.size());
+        return matching.get(0);
+    }
+
+    private void assertRejected(String offerId, String reasonCode) throws Exception {
+        assertFailedWithoutItem(offerId);
+        JsonNode reject = ackFor(offerId);
+        assertEquals("Reject", reject.path("type").asText());
+        assertEquals(offerId, reject.path("object").path("id").asText());
+        assertTrue(reject.path("context").isMissingNode());
+        assertThat(reject.path("summary").asText(), startsWith(reasonCode + ": "));
     }
 
     private void assertFailedWithoutItem(String id) throws Exception {
@@ -289,7 +375,7 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         n.setType(Set.of("Offer", "coar-notify:IngestAction"));
         Service origin = new Service();
         origin.setId(ORIGIN_ID);
-        origin.setInbox(ORIGIN_INBOX);
+        origin.setInbox(originInbox);
         origin.setType(Set.of("Service"));
         n.setOrigin(origin);
         Service target = new Service();
@@ -344,8 +430,14 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         serve("/files/no-digest", 200, null);
         serve("/files/bad-digest", 200, "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         serve("/files/expired", 410, null);
+        server.createContext("/api/coar-notify/inbox", exchange -> {
+            acks.add(new ObjectMapper().readTree(exchange.getRequestBody().readAllBytes()));
+            exchange.sendResponseHeaders(inboxStatus, -1);
+            exchange.close();
+        });
         server.start();
         baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        originInbox = baseUrl + "/api/coar-notify/inbox";
     }
 
     private void serve(String path, int status, String reprDigest) {

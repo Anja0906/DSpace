@@ -26,6 +26,7 @@ import org.apache.logging.log4j.Logger;
 import org.dspace.app.ldn.LDNFileTransferException;
 import org.dspace.app.ldn.action.LDNAction;
 import org.dspace.app.ldn.action.LDNActionStatus;
+import org.dspace.app.ldn.action.SendAcknowledgementAction;
 import org.dspace.app.ldn.model.Notification;
 import org.dspace.app.ldn.model.Url;
 import org.dspace.app.ldn.utility.RemoteFileFetcher;
@@ -57,7 +58,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 /**
  * Linked Data Notification processor for Offer + coar-notify:IngestAction. The file referenced by
  * object.ietf:item.id is downloaded, checked against its Repr-Digest and archived as a new item in the
- * collection configured by ldn.filetransfer.collection.
+ * collection configured by ldn.filetransfer.collection. The sender gets an Accept or a Reject.
  */
 public class LDNFileTransferProcessor implements LDNProcessor {
 
@@ -97,9 +98,11 @@ public class LDNFileTransferProcessor implements LDNProcessor {
 
     private LDNProcessor fallbackProcessor;
 
+    private SendAcknowledgementAction acknowledgementAction;
+
     /**
-     * Ingest the offered file and run the actions on the new item. A repeated offer runs the actions on the
-     * item created the first time.
+     * Ingest the offered file, reply Accept and run the actions on the new item, or reply Reject. A repeated
+     * offer is answered with the item created the first time.
      *
      * @param context      current context
      * @param notification received offer
@@ -111,31 +114,52 @@ public class LDNFileTransferProcessor implements LDNProcessor {
             fallbackProcessor.process(context, notification);
             return;
         }
-        Url itemUrl = notification.getObject() != null ? notification.getObject().getUrl() : null;
-        if (itemUrl == null || StringUtils.isBlank(itemUrl.getId())) {
-            throw new LDNFileTransferException(URL_REJECTED, "offer has no object.ietf:item.id");
-        }
-
         EPerson previousUser = context.getCurrentUser();
         context.turnOffAuthorisationSystem();
         try {
-            Item item = findExisting(context, notification.getId());
-            if (item != null) {
-                log.info("Offer {} was already ingested as item {}", notification.getId(), item.getID());
-                context.setCurrentUser(item.getSubmitter());
-            } else {
-                Collection collection = resolveCollection(context);
-                context.setCurrentUser(resolveSubmitter(context));
-                item = ingest(context, notification, itemUrl, collection);
+            Item item;
+            try {
+                item = findOrIngest(context, notification);
+            } catch (Exception e) {
+                LDNFileTransferException failure = e instanceof LDNFileTransferException transferException
+                    ? transferException
+                    : new LDNFileTransferException(INGEST_FAILED, e.getClass().getSimpleName() + ": "
+                        + e.getMessage(), e);
+                log.warn("File transfer for offer {} failed: {}", notification.getId(), failure.getSummary());
+                if (acknowledgementAction != null) {
+                    acknowledgementAction.reject(context, notification, failure.getSummary());
+                }
+                throw failure;
             }
-            runActions(context, notification, item);
-        } catch (LDNFileTransferException e) {
-            log.warn("File transfer for offer {} failed: {}", notification.getId(), e.getSummary());
-            throw e;
+            // the item exists, so a failing action must not turn the Accept into a Reject
+            try {
+                if (acknowledgementAction != null) {
+                    acknowledgementAction.accept(context, notification, item);
+                }
+                runActions(context, notification, item);
+            } catch (Exception e) {
+                log.error("Action failed for offer {}, item {} was created", notification.getId(), item.getID(), e);
+            }
         } finally {
             context.restoreAuthSystemState();
             context.setCurrentUser(previousUser);
         }
+    }
+
+    private Item findOrIngest(Context context, Notification notification) throws Exception {
+        Url itemUrl = notification.getObject() != null ? notification.getObject().getUrl() : null;
+        if (itemUrl == null || StringUtils.isBlank(itemUrl.getId())) {
+            throw new LDNFileTransferException(URL_REJECTED, "offer has no object.ietf:item.id");
+        }
+        Item existing = findExisting(context, notification.getId());
+        if (existing != null) {
+            log.info("Offer {} was already ingested as item {}", notification.getId(), existing.getID());
+            context.setCurrentUser(existing.getSubmitter());
+            return existing;
+        }
+        Collection collection = resolveCollection(context);
+        context.setCurrentUser(resolveSubmitter(context));
+        return ingest(context, notification, itemUrl, collection);
     }
 
     private Item ingest(Context context, Notification notification, Url itemUrl, Collection collection)
@@ -288,5 +312,13 @@ public class LDNFileTransferProcessor implements LDNProcessor {
 
     public void setFallbackProcessor(LDNProcessor fallbackProcessor) {
         this.fallbackProcessor = fallbackProcessor;
+    }
+
+    public SendAcknowledgementAction getAcknowledgementAction() {
+        return acknowledgementAction;
+    }
+
+    public void setAcknowledgementAction(SendAcknowledgementAction acknowledgementAction) {
+        this.acknowledgementAction = acknowledgementAction;
     }
 }

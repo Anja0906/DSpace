@@ -216,6 +216,9 @@
             </list>
         </property>
         <property name="fallbackProcessor" ref="offerIngestMetadataAction" />
+        <property name="acknowledgementAction">
+            <bean class="org.dspace.app.ldn.action.SendAcknowledgementAction" />
+        </property>
     </bean>
 
     <bean name="offerIngestMetadataAction" class="org.dspace.app.ldn.processor.LDNMetadataProcessor">
