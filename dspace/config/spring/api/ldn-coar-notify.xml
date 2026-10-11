@@ -206,7 +206,19 @@
         </property>
     </bean>
 
-    <bean name="offerIngestAction" class="org.dspace.app.ldn.processor.LDNMetadataProcessor">
+    <bean name="offerIngestAction" class="org.dspace.app.ldn.processor.LDNFileTransferProcessor">
+        <property name="actions">
+            <list value-type="org.dspace.app.ldn.action.LDNAction">
+                <bean class="org.dspace.app.ldn.action.LDNEmailAction">
+                    <property name="actionSendFilter" value="${ldn.notification.email}" />
+                    <property name="actionSendEmailTextFile" value="coar_notify_ingested" />
+                </bean>
+            </list>
+        </property>
+        <property name="fallbackProcessor" ref="offerIngestMetadataAction" />
+    </bean>
+
+    <bean name="offerIngestMetadataAction" class="org.dspace.app.ldn.processor.LDNMetadataProcessor">
         <property name="actions">
             <list value-type="org.dspace.app.ldn.action.LDNAction">
                 <bean class="org.dspace.app.ldn.action.LDNEmailAction">
