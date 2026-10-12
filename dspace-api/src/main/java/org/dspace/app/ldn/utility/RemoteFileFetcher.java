@@ -55,6 +55,9 @@ public class RemoteFileFetcher {
 
     private static final Pattern FILENAME = Pattern.compile("filename\\s*=\\s*\"?([^\";]+)\"?");
 
+    private static final Pattern FILENAME_UTF8 =
+        Pattern.compile("filename\\*\\s*=\\s*UTF-8''([^;]+)", Pattern.CASE_INSENSITIVE);
+
     private final ConfigurationService configurationService;
 
     public RemoteFileFetcher(ConfigurationService configurationService) {
@@ -185,9 +188,12 @@ public class RemoteFileFetcher {
 
     private static String filename(String contentDisposition, String url) {
         String name = "";
-        Matcher matcher = FILENAME.matcher(StringUtils.defaultString(contentDisposition));
-        if (matcher.find()) {
-            name = matcher.group(1);
+        Matcher utf8Name = FILENAME_UTF8.matcher(StringUtils.defaultString(contentDisposition));
+        Matcher plainName = FILENAME.matcher(StringUtils.defaultString(contentDisposition));
+        if (utf8Name.find()) {
+            name = URLDecoder.decode(utf8Name.group(1).trim(), StandardCharsets.UTF_8);
+        } else if (plainName.find()) {
+            name = plainName.group(1);
         } else {
             try {
                 String path = StringUtils.defaultString(new URI(url).getPath());
