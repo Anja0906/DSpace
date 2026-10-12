@@ -13,6 +13,8 @@ import static org.dspace.app.ldn.LDNFileTransferException.INGEST_FAILED;
 import static org.dspace.app.ldn.LDNFileTransferException.URL_REJECTED;
 
 import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -151,9 +153,10 @@ public class LDNFileTransferProcessor implements LDNProcessor {
         if (itemUrl == null || StringUtils.isBlank(itemUrl.getId())) {
             throw new LDNFileTransferException(URL_REJECTED, "offer has no object.ietf:item.id");
         }
-        Item existing = findExisting(context, notification.getId());
+        Item existing = findExisting(context, notification.getId(), getFileKey(itemUrl.getId()));
         if (existing != null) {
-            log.info("Offer {} was already ingested as item {}", notification.getId(), existing.getID());
+            log.info("Offer {} is for a file already ingested as item {}", notification.getId(),
+                existing.getID());
             context.setCurrentUser(existing.getSubmitter());
             return existing;
         }
@@ -238,6 +241,10 @@ public class LDNFileTransferProcessor implements LDNProcessor {
             itemService.addMetadata(context, item, "dc", "source", null, null, notification.getObject().getId());
         }
         itemService.addMetadata(context, item, "dc", "identifier", "other", null, notification.getId());
+        String fileKey = getFileKey(notification.getObject().getUrl().getId());
+        if (fileKey != null) {
+            itemService.addMetadata(context, item, "dc", "identifier", "other", null, fileKey);
+        }
         String origin = notification.getOrigin() != null ? notification.getOrigin().getId() : null;
         itemService.addMetadata(context, item, "dc", "description", "provenance", "en",
             "Ingested via COAR Notify from " + origin + ", notification " + notification.getId()
@@ -257,10 +264,34 @@ public class LDNFileTransferProcessor implements LDNProcessor {
         return bitstreamFormatService.guessFormat(context, bitstream);
     }
 
-    private Item findExisting(Context context, String notificationId) throws SQLException, AuthorizeException {
-        Iterator<Item> items = itemService.findArchivedByMetadataField(context, "dc", "identifier", "other",
-            notificationId);
-        return items.hasNext() ? items.next() : null;
+    private Item findExisting(Context context, String notificationId, String fileKey)
+        throws SQLException, AuthorizeException {
+        for (String key : new String[] {notificationId, fileKey}) {
+            if (key != null) {
+                Iterator<Item> items =
+                    itemService.findArchivedByMetadataField(context, "dc", "identifier", "other", key);
+                if (items.hasNext()) {
+                    return items.next();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The item URL without query and fragment. A sender re-offering a file uses a new notification id and
+     * a new token in the query, so this is what identifies the file across offers.
+     */
+    private String getFileKey(String itemUrl) {
+        if (!configurationService.getBooleanProperty("ldn.filetransfer.dedup-by-file-url", true)) {
+            return null;
+        }
+        try {
+            URI uri = new URI(itemUrl);
+            return new URI(uri.getScheme(), uri.getAuthority(), uri.getPath(), null, null).toString();
+        } catch (URISyntaxException e) {
+            return null;
+        }
     }
 
     private EPerson resolveSubmitter(Context context) throws SQLException, LDNFileTransferException {

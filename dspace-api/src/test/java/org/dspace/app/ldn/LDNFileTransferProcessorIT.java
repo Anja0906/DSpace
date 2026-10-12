@@ -215,7 +215,7 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         assertEquals("Accept", ackFor(accepted).path("type").asText());
 
         configurationService.setProperty("ldn.filetransfer.require-digest", true);
-        String rejected = queueOffer(baseUrl + "/files/no-digest", "application/pdf");
+        String rejected = queueOffer(baseUrl + "/files/no-digest-2", "application/pdf");
         ldnMessageService.extractAndProcessMessageFromQueue(context);
         assertRejected(rejected, "digest-missing");
     }
@@ -289,6 +289,23 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         assertEquals("Accept", acks.get(1).path("type").asText());
         assertEquals(acks.get(0).path("context").path("id").asText(),
             acks.get(1).path("context").path("id").asText());
+    }
+
+    @Test
+    public void reOfferOfSameFileGetsAcceptForExistingItem() throws Exception {
+        String first = queueOffer(baseUrl + "/files/ok?transferToken=aaa&expires=1", "application/pdf");
+        ldnMessageService.extractAndProcessMessageFromQueue(context);
+        String second = queueOffer(baseUrl + "/files/ok?transferToken=bbb&expires=2", "application/pdf");
+        ldnMessageService.extractAndProcessMessageFromQueue(context);
+
+        assertEquals(QUEUE_STATUS_PROCESSED, ldnMessageService.find(context, second).getQueueStatus());
+        List<Item> items = itemsFor(first);
+        assertEquals(1, items.size());
+        assertEquals(1, hits("/files/ok"));
+        assertEquals("Accept", ackFor(second).path("type").asText());
+        assertEquals(ackFor(first).path("context").path("id").asText(),
+            ackFor(second).path("context").path("id").asText());
+        assertThat(values(items.get(0), "dc", "identifier", "other"), hasItem(baseUrl + "/files/ok"));
     }
 
     @Test
@@ -428,6 +445,7 @@ public class LDNFileTransferProcessorIT extends AbstractIntegrationTestWithDatab
         String sha256 = Base64.getEncoder().encodeToString(ReprDigest.newSha256().digest(PDF));
         serve("/files/ok", 200, "sha-256=:" + sha256 + ":");
         serve("/files/no-digest", 200, null);
+        serve("/files/no-digest-2", 200, null);
         serve("/files/bad-digest", 200, "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:");
         serve("/files/expired", 410, null);
         server.createContext("/api/coar-notify/inbox", exchange -> {
